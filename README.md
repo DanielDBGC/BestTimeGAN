@@ -223,21 +223,6 @@ Run interactively in:
 
 ---
 
-## Citation
-
-If you use this code in your research, please consider citing the original TimeGAN paper:
-
-```bibtex
-@inproceedings{yoon2019timegan,
-  title     = {Time-series Generative Adversarial Networks},
-  author    = {Yoon, Jinsung and Jarrett, Daniel and van der Schaar, Mihaela},
-  booktitle = {Advances in Neural Information Processing Systems},
-  year      = {2019}
-}
-```
-
----
-
 ## License
 
 This repository is part of a thesis project at [ITAM](https://www.itam.mx/). Please contact the author before reusing the code.
