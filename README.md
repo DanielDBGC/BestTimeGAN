@@ -10,7 +10,6 @@ BestTimeGAN adapts the [TimeGAN](https://papers.nips.cc/paper/2019/hash/c9efe5f2
 
 - **Conditional generation** — label embeddings are injected into the Embedder, Supervisor, and Generator so every synthetic segment is tied to a specific stimulus frequency class (15 classes, 4–60 Hz in 4 Hz steps).
 - **TCN Discriminator** — a Temporal Convolutional Network (TCN) replaces the recurrent discriminator in the joint training stage, providing stable gradients over long sequences.
-- **Geometry loss** — a cosine-similarity regulariser on the latent space prevents representation collapse in the Embedder.
 - **Spectral loss** — a Log-Spectral Distance (LSD) term in joint training keeps the frequency profile of synthetic signals consistent with real data.
 - **Best-checkpoint + early stopping** — training scripts monitor validation loss and automatically save the best model.
 
