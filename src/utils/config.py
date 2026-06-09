@@ -9,7 +9,11 @@ WINDOW_STRIDE = 128
 BATCH_SIZE = 32
 
 LATENT_DIM = 12
-NOISE_DIM = 24
+NOISE_DIM = LATENT_DIM  # noise dimension equals latent dim; label info is injected via embeddings
+
+# Class conditioning
+NUM_CLASSES = 15
+LABEL_EMB_DIM = 16
 
 LR_EMBEDDER = 5e-4
 LR_RECOVERY = 1e-3

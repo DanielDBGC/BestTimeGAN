@@ -24,7 +24,7 @@ def generator_adv_loss(d_fake):
     # WGAN generator loss: minimize -fake
     return -torch.mean(d_fake)
 
-def gradient_penalty(D, h_real, h_fake, device="cuda"):
+def gradient_penalty(D, h_real, h_fake, device="cuda", labels=None):
     B, T, C = h_real.shape
     alpha = torch.rand(B, 1, 1, device=device)
     alpha = alpha.expand(B, T, C)
@@ -32,7 +32,10 @@ def gradient_penalty(D, h_real, h_fake, device="cuda"):
     interpolates = alpha * h_real + ((1 - alpha) * h_fake)
     interpolates = interpolates.requires_grad_(True)
 
-    d_interpolates = D(interpolates)
+    if labels is not None:
+        d_interpolates = D(interpolates, labels)
+    else:
+        d_interpolates = D(interpolates)
 
     if d_interpolates.ndim > 2:
         d_interpolates = d_interpolates.mean(dim=1)
