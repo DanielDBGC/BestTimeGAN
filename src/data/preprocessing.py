@@ -110,14 +110,42 @@ def load_all_freq(
     logger,
     stim_freqs: list[float] | None = None,
     **kwargs,
-) -> tuple[np.ndarray, dict]:
+) -> tuple[np.ndarray, list, dict]:
     """
-    Load all requested SSVEP frequencies from multiple subjects.
+    Load SSVEP EEG data for multiple subjects across all requested stimulus frequencies.
 
-    Returns:
-        trials_arr: np.ndarray [N_trials, T, C]
-        subject_stats: dict mapping subj_id -> {'mean': ..., 'std': ...}
+    Each subject is Z-score normalised per channel before being pooled with others.
+
+    Parameters
+    ----------
+    subject_ids : list of int
+        Subject IDs to load (e.g. [1, 2, 3]).
+    block_ids : list of int
+        Recording block IDs to include per subject.
+    base_path : str
+        Root directory containing the raw EDF and TSV files.
+    logger : logging.Logger
+        Logger instance for progress messages.
+    stim_freqs : list of float or None
+        SSVEP stimulus frequencies (Hz) to include.
+        **Pass a subset here to restrict training to fewer classes.**
+        For example, ``stim_freqs=[8.0, 12.0]`` yields only two-class data.
+        Defaults to ``[4, 8, 12, …, 60]`` when None.
+    **kwargs
+        Forwarded to :func:`extract_frequency_segments`
+        (``duration_sec``, ``l_freq``, ``h_freq``, ``picks``).
+
+    Returns
+    -------
+    trials_arr : np.ndarray of shape [N_trials, T, C]
+        Stacked, normalised EEG windows.  All trials must have equal length T.
+    all_labels : list of float
+        Raw stimulus frequency for each trial (before any integer remapping).
+        Length matches ``trials_arr.shape[0]``.
+    subject_stats : dict
+        Maps each loaded subject ID to its per-channel ``{'mean', 'std'}`` dict.
     """
+
 
     # Default: 4, 8, 12, ..., 60
     if stim_freqs is None:

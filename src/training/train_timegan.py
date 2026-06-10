@@ -1,5 +1,5 @@
 import torch
-from src.models.embedder import Embedder
+from src.models.embedder import Embedder, cEmbedder
 from src.models.generator import Generator, cGenerator
 from src.models.supervisor import Supervisor
 from src.models.discriminator import Discriminator, cTCNDiscriminator
@@ -29,6 +29,7 @@ def train_timegan(
     lambda_spec: float,
     z_dim: int,
     sup_loss_window: int = 1,
+    orig_labels_map: torch.Tensor = None,
 ):
     """
     Joint GAN training loop for TimeGAN.
@@ -50,6 +51,7 @@ def train_timegan(
     # ------------------------------------------------------------------
     is_cond_G = isinstance(G, cGenerator)
     is_cond_D = isinstance(D, cTCNDiscriminator)
+    is_cond_E = isinstance(E, cEmbedder)
 
     # ------------------------------------------------------------------
     # Validation batch (fixed, grabbed once from dataloader)
@@ -99,6 +101,12 @@ def train_timegan(
                 x      = batch
                 labels = None
 
+            # Get the original labels for pre-trained models E and S
+            if labels is not None and orig_labels_map is not None:
+                orig_labels = orig_labels_map[labels]
+            else:
+                orig_labels = labels
+
             x = x.to(device)
             B, T, _ = x.shape
 
@@ -107,10 +115,13 @@ def train_timegan(
             # ===========================================================
             for _ in range(5):
                 with torch.no_grad():
-                    h_real = E(x)
+                    if is_cond_E:
+                        h_real, _ = E(x, orig_labels)
+                    else:
+                        h_real = E(x)
                     z_d    = torch.randn(B, T, z_dim, device=device)
                     h_fake = G(z_d, labels) if is_cond_G else G(z_d)
-                    h_fake = S(h_fake, labels) if labels is not None else S(h_fake)
+                    h_fake = S(h_fake, orig_labels) if orig_labels is not None else S(h_fake)
 
                 d_real = D(h_real, labels) if is_cond_D else D(h_real)
                 d_fake = D(h_fake, labels) if is_cond_D else D(h_fake)
@@ -134,11 +145,14 @@ def train_timegan(
             z = torch.randn(B, T, z_dim, device=device)
 
             with torch.no_grad():
-                h_real = E(x)  # [B, T, H]
+                if is_cond_E:
+                    h_real, _ = E(x, orig_labels)  # [B, T, H]
+                else:
+                    h_real = E(x)
 
             # Fake latent trajectory
             h_fake     = G(z, labels) if is_cond_G else G(z)          # [B, T, H]
-            h_fake_sup = S(h_fake, labels) if labels is not None else S(h_fake)  # [B, T, H]
+            h_fake_sup = S(h_fake, orig_labels) if orig_labels is not None else S(h_fake)  # [B, T, H]
 
             # Adversarial loss
             d_fake_g = D(h_fake_sup, labels) if is_cond_D else D(h_fake_sup)
@@ -153,7 +167,7 @@ def train_timegan(
 
             h_real_slice = h_real[:, :-sup_loss_window, :]
             h_real_pred  = (
-                S(h_real_slice, labels) if labels is not None else S(h_real_slice)
+                S(h_real_slice, orig_labels) if orig_labels is not None else S(h_real_slice)
             )
             g_sup_real = torch.mean(
                 (h_real_pred - h_real[:, sup_loss_window:, :]) ** 2
@@ -207,8 +221,10 @@ def train_timegan(
                 B_v, T_v, _ = val_batch.shape
                 z_val = torch.randn(B_v, T_v, z_dim, device=device)
 
+                orig_val_labels = orig_labels_map[val_labels] if (val_labels is not None and orig_labels_map is not None) else val_labels
+
                 h_fv    = G(z_val, val_labels) if is_cond_G else G(z_val)
-                h_fv_s  = S(h_fv, val_labels) if val_labels is not None else S(h_fv)
+                h_fv_s  = S(h_fv, orig_val_labels) if orig_val_labels is not None else S(h_fv)
                 x_fv    = R(h_fv_s)
 
                 acf_val   = acf_error(val_batch, x_fv)

@@ -31,8 +31,16 @@ from src.utils.config import (
 from src.utils.seed import set_seed
 from src.utils.logging import get_logger
 import logging
+
+# ---------------------------------------------------------------------------
+# Class filter — set to None to train on all classes in the .h5 files,
+# or pass a list of 0-based label integers to restrict the GAN to a subset.
+# Example: [0, 1] trains on the first two classes only.
+# The autoencoder / supervisor .h5 files are unchanged.
+# ---------------------------------------------------------------------------
+GAN_CLASSES = [0, 1]  # <- edit here; None = all classes
 from src.data.H5_dataset import EEGH5Dataset
-from src.models.embedder import Embedder
+from src.models.embedder import cEmbedder
 from src.models.recovery import Recovery
 from src.models.supervisor import Supervisor
 from src.models.generator import cGenerator
@@ -48,10 +56,17 @@ def main():
     logger.info(f"Using device: {device}")
 
     # ------------------------------------------------------------------
-    # Data — use EEGH5Dataset which yields (x, label) pairs
+    # Data — EEGH5Dataset yields (x, label) pairs.
+    # Pass keep_classes to restrict the GAN to a subset of the full
+    # label set that was used for the autoencoder / supervisor.
     # ------------------------------------------------------------------
-    train_dataset = EEGH5Dataset("data/processed/eeg_train.h5")
-    val_dataset   = EEGH5Dataset("data/processed/eeg_val.h5")
+    n_gan_classes = len(GAN_CLASSES) if GAN_CLASSES is not None else NUM_CLASSES
+    logger.info(
+        f"GAN class filter: {GAN_CLASSES}  ({n_gan_classes} class(es))"
+    )
+
+    train_dataset = EEGH5Dataset("data/processed/eeg_train.h5", keep_classes=GAN_CLASSES)
+    val_dataset   = EEGH5Dataset("data/processed/eeg_val.h5",   keep_classes=GAN_CLASSES)
 
     dataloader = DataLoader(
         train_dataset,
@@ -69,9 +84,11 @@ def main():
     # ------------------------------------------------------------------
     # Models
     # ------------------------------------------------------------------
-    E = Embedder(
+    E = cEmbedder(
         x_dim=NUM_CHANNELS,
         h_dim=LATENT_DIM,
+        num_classes=NUM_CLASSES,
+        label_emb_dim=LABEL_EMB_DIM,
         num_layers=NUM_LAYERS_EMBEDDER,
     ).to(device)
 
@@ -87,14 +104,14 @@ def main():
         h_dim=HIDDEN_DIM_GENERATOR,
         num_layers=NUM_LAYERS_GENERATOR,
         out_dim=LATENT_DIM,
-        num_classes=NUM_CLASSES,
+        num_classes=n_gan_classes,    # sized to the GAN subset
         label_emb_dim=LABEL_EMB_DIM,
     ).to(device)
 
     D = cTCNDiscriminator(
         in_channels=LATENT_DIM,
         hidden_channels=HIDDEN_DIM_DISCRIMINATOR,
-        num_classes=NUM_CLASSES,
+        num_classes=n_gan_classes,    # sized to the GAN subset
         label_emb_dim=LABEL_EMB_DIM,
     ).to(device)
 
@@ -127,6 +144,8 @@ def main():
     # ------------------------------------------------------------------
     # Train TimeGAN
     # ------------------------------------------------------------------
+    orig_labels_map = torch.tensor(GAN_CLASSES, dtype=torch.long, device=device) if GAN_CLASSES is not None else None
+
     train_timegan(
         E,
         G,
@@ -145,6 +164,7 @@ def main():
         lambda_spec=LAMBDA_SPEC,
         z_dim=NOISE_DIM,
         sup_loss_window=SUP_LOSS_WINDOW,
+        orig_labels_map=orig_labels_map,
     )
 
     # Final explicit saves (best-per-metric are saved inside train_timegan)
