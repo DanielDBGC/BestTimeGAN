@@ -38,10 +38,10 @@ import logging
 # Example: [0, 1] trains on the first two classes only.
 # The autoencoder / supervisor .h5 files are unchanged.
 # ---------------------------------------------------------------------------
-GAN_CLASSES = [0, 1]  # <- edit here; None = all classes
+GAN_CLASSES = [2, 3]  # <- edit here; None = all classes
 from src.data.H5_dataset import EEGH5Dataset
 from src.models.embedder import cEmbedder
-from src.models.recovery import Recovery
+from src.models.recovery import cRecovery
 from src.models.supervisor import Supervisor
 from src.models.generator import cGenerator
 from src.models.discriminator import cTCNDiscriminator
@@ -79,6 +79,17 @@ def main():
         drop_last=True,
     )
 
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
+        drop_last=False,
+    )
+
     logger.info(f"Dataset windows: {len(train_dataset)}")
 
     # ------------------------------------------------------------------
@@ -86,21 +97,16 @@ def main():
     # ------------------------------------------------------------------
     E = cEmbedder(
         x_dim=NUM_CHANNELS,
-        h_dim=LATENT_DIM,
-        num_classes=NUM_CLASSES,
-        label_emb_dim=LABEL_EMB_DIM,
-        num_layers=NUM_LAYERS_EMBEDDER,
+        h_dim=LATENT_DIM
     ).to(device)
 
     S = Supervisor(
         h_dim=LATENT_DIM,
-        num_layers=NUM_LAYERS_SUPERVISOR,
-        num_classes=NUM_CLASSES,
-        label_emb_dim=LABEL_EMB_DIM,
+        num_layers=NUM_LAYERS_SUPERVISOR
     ).to(device)
 
     G = cGenerator(
-        z_dim=NOISE_DIM,              # = LATENT_DIM (no +4 workaround)
+        z_dim=NOISE_DIM,
         h_dim=HIDDEN_DIM_GENERATOR,
         num_layers=NUM_LAYERS_GENERATOR,
         out_dim=LATENT_DIM,
@@ -115,10 +121,9 @@ def main():
         label_emb_dim=LABEL_EMB_DIM,
     ).to(device)
 
-    R = Recovery(
+    R = cRecovery(
         h_dim=LATENT_DIM,
         x_dim=NUM_CHANNELS,
-        num_layers=NUM_LAYERS_RECOVERY,
     ).to(device)
 
     # Load pre-trained autoencoder weights (E, S, R)
@@ -153,6 +158,7 @@ def main():
         R,
         D,
         dataloader,
+        val_dataloader,
         optimizer_gs,
         optimizer_d,
         device,
