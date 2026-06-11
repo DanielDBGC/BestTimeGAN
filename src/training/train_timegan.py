@@ -1,8 +1,10 @@
 import torch
+from torch.amp import autocast, GradScaler
 from src.models.embedder import Embedder, cEmbedder
 from src.models.generator import Generator, cGenerator
 from src.models.supervisor import Supervisor
 from src.models.discriminator import Discriminator, cTCNDiscriminator
+from src.models.recovery import Recovery, cRecovery
 from src.losses.losses import (
     generator_adv_loss,
     discriminator_loss,
@@ -18,6 +20,7 @@ import logging
 def train_timegan(
     E, G, S, R, D,
     dataloader,
+    val_dataloader,
     opt_gs,
     opt_d,
     device,
@@ -46,24 +49,17 @@ def train_timegan(
 
     E.eval()  # frozen permanently
 
-    # ------------------------------------------------------------------
-    # Detect whether models are conditional
-    # ------------------------------------------------------------------
+    scaler_gs = GradScaler('cuda')
+    scaler_d  = GradScaler('cuda')
+
+    is_cond_E = isinstance(E, cEmbedder)
     is_cond_G = isinstance(G, cGenerator)
     is_cond_D = isinstance(D, cTCNDiscriminator)
-    is_cond_E = isinstance(E, cEmbedder)
+    is_cond_R = isinstance(R, cRecovery)
 
     # ------------------------------------------------------------------
-    # Validation batch (fixed, grabbed once from dataloader)
+    # Validation data will be evaluated using val_dataloader
     # ------------------------------------------------------------------
-    first_batch = next(iter(dataloader))
-    if isinstance(first_batch, (tuple, list)):
-        val_batch, val_labels = first_batch
-    else:
-        val_batch, val_labels = first_batch, None
-
-    val_batch  = val_batch.to(device)
-    val_labels = val_labels.to(device) if val_labels is not None else None
 
     # ------------------------------------------------------------------
     # Per-metric bests + patience
@@ -78,7 +74,7 @@ def train_timegan(
 
     def _save(tag, state):
         torch.save(state, f"checkpoints/best_timegan_{tag}.pt")
-        logger.info(f"  → Checkpoint saved: best_timegan_{tag}.pt")
+        logger.info(f"Checkpoint saved: best_timegan_{tag}.pt")
 
     checkpoint_state = lambda: {
         "E": E.state_dict(),
@@ -92,7 +88,7 @@ def train_timegan(
     # Training loop
     # ------------------------------------------------------------------
     for epoch in range(epochs):
-        for batch in dataloader:
+        for batch_idx, batch in enumerate(dataloader):
             # Unpack labels when the dataset is conditional
             if isinstance(batch, (tuple, list)):
                 x, labels = batch
@@ -110,106 +106,106 @@ def train_timegan(
             x = x.to(device)
             B, T, _ = x.shape
 
-            # ===========================================================
-            # (1) Discriminator update  — 5 steps per G step
-            # ===========================================================
-            for _ in range(5):
-                with torch.no_grad():
-                    if is_cond_E:
-                        h_real, _ = E(x, orig_labels)
-                    else:
-                        h_real = E(x)
-                    z_d    = torch.randn(B, T, z_dim, device=device)
-                    h_fake = G(z_d, labels) if is_cond_G else G(z_d)
-                    h_fake = S(h_fake, orig_labels) if orig_labels is not None else S(h_fake)
-
-                d_real = D(h_real, labels) if is_cond_D else D(h_real)
-                d_fake = D(h_fake, labels) if is_cond_D else D(h_fake)
-
-                d_loss_val = discriminator_loss(d_real, d_fake)
-
-                if epoch % 3 == 0:
-                    gp = gradient_penalty(D, h_real, h_fake, device=device, labels=labels)
-                else:
-                    gp = 0.0
-
-                d_loss = d_loss_val + 10.0 * gp
-
-                opt_d.zero_grad(set_to_none=True)
-                d_loss.backward()
-                opt_d.step()
-
-            # ===========================================================
-            # (2) Generator + Supervisor update
-            # ===========================================================
-            z = torch.randn(B, T, z_dim, device=device)
-
             with torch.no_grad():
                 if is_cond_E:
-                    h_real, _ = E(x, orig_labels)  # [B, T, H]
+                    h_real, _ = E(x, orig_labels)
                 else:
                     h_real = E(x)
 
-            # Fake latent trajectory
-            h_fake     = G(z, labels) if is_cond_G else G(z)          # [B, T, H]
-            h_fake_sup = S(h_fake, orig_labels) if orig_labels is not None else S(h_fake)  # [B, T, H]
+            # ===========================================================
+            # (1) Discriminator update  — 1 step per batch
+            # ===========================================================
+            
+            with torch.no_grad():
+                z_d    = torch.randn(B, T, z_dim, device=device)
+                with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
+                    h_fake_d = G(z_d, labels) if is_cond_G else G(z_d)
+                    h_fake_d = S(h_fake_d, orig_labels) if orig_labels is not None else S(h_fake_d)
 
-            # Adversarial loss
-            d_fake_g = D(h_fake_sup, labels) if is_cond_D else D(h_fake_sup)
-            g_adv    = generator_adv_loss(d_fake_g)
+            with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
+                d_real = D(h_real, labels) if is_cond_D else D(h_real)
+                d_fake = D(h_fake_d, labels) if is_cond_D else D(h_fake_d)
+                d_loss_val = discriminator_loss(d_real, d_fake)
 
-            # -----------------------------------------------------------
-            # Supervised loss
-            # -----------------------------------------------------------
-            g_sup_fake = torch.mean(
-                (h_fake_sup[:, :-sup_loss_window, :] - h_fake[:, sup_loss_window:, :]) ** 2
-            )
+            gp = gradient_penalty(D, h_real, h_fake_d, device=device, labels=labels)
+            d_loss = d_loss_val + 10.0 * gp
 
-            h_real_slice = h_real[:, :-sup_loss_window, :]
-            h_real_pred  = (
-                S(h_real_slice, orig_labels) if orig_labels is not None else S(h_real_slice)
-            )
-            g_sup_real = torch.mean(
-                (h_real_pred - h_real[:, sup_loss_window:, :]) ** 2
-            )
+            opt_d.zero_grad(set_to_none=True)
+            scaler_d.scale(d_loss).backward()
+            scaler_d.step(opt_d)
+            scaler_d.update()
 
-            g_sup = g_sup_fake + g_sup_real
+            # ===========================================================
+            # (2) Generator + Supervisor update — every 5 batches
+            # ===========================================================
+            if batch_idx % 5 == 0:
+                z = torch.randn(B, T, z_dim, device=device)
 
-            # -----------------------------------------------------------
-            # Moment matching in data space
-            # -----------------------------------------------------------
-            x_fake = R(h_fake_sup)
+                with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
+                    # Fake latent trajectory
+                    h_fake     = G(z, labels) if is_cond_G else G(z)          # [B, T, H]
+                    h_fake_sup = S(h_fake, orig_labels) if orig_labels is not None else S(h_fake)  # [B, T, H]
 
-            mean_real = torch.mean(x,      dim=0)
-            mean_fake = torch.mean(x_fake, dim=0)
+                    # Adversarial loss
+                    d_fake_g = D(h_fake_sup, labels) if is_cond_D else D(h_fake_sup)
+                    g_adv    = generator_adv_loss(d_fake_g)
 
-            var_real  = torch.var(x,      dim=0, unbiased=False)
-            var_fake  = torch.var(x_fake, dim=0, unbiased=False)
+                    # -----------------------------------------------------------
+                    # Supervised loss
+                    # -----------------------------------------------------------
+                    g_sup_fake = torch.mean(
+                        (h_fake_sup[:, :-sup_loss_window, :] - h_fake[:, sup_loss_window:, :]) ** 2
+                    )
 
-            x_flat      = x.reshape(-1, x.shape[-1])
-            x_fake_flat = x_fake.reshape(-1, x_fake.shape[-1])
-            cov_real    = torch.cov(x_flat.T)
-            cov_fake    = torch.cov(x_fake_flat.T)
+                    h_real_slice = h_real[:, :-sup_loss_window, :].detach()
+                    h_real_pred  = (
+                        S(h_real_slice, orig_labels) if orig_labels is not None else S(h_real_slice)
+                    )
+                    g_sup_real = torch.mean(
+                        (h_real_pred - h_real[:, sup_loss_window:, :]) ** 2
+                    )
 
-            mean_loss = torch.mean((mean_real - mean_fake) ** 2)
-            var_loss  = torch.mean((var_real  - var_fake)  ** 2)
-            cov_loss  = torch.mean((cov_real  - cov_fake)  ** 2)
+                    g_sup = g_sup_fake + g_sup_real
 
-            g_mom = mean_loss + var_loss + cov_loss
+                    # -----------------------------------------------------------
+                    # Moment matching in data space
+                    # -----------------------------------------------------------
+                    x_fake = R(h_fake_sup, orig_labels) if is_cond_R else R(h_fake_sup)
+                    x_fake = x_fake.float()  # ensure float32 for stable statistics/spectral ops
 
-            # -----------------------------------------------------------
-            # Spectral loss (Log-Spectral Distance)
-            # -----------------------------------------------------------
-            spectral_loss = lsd(x, x_fake)
+                    mean_real = torch.mean(x,      dim=0)
+                    mean_fake = torch.mean(x_fake, dim=0)
 
-            # -----------------------------------------------------------
-            # Total generator loss
-            # -----------------------------------------------------------
-            g_loss = g_adv + lambda_sup * g_sup + lambda_mom * g_mom + lambda_spec * spectral_loss
+                    var_real  = torch.var(x,      dim=0, unbiased=False)
+                    var_fake  = torch.var(x_fake, dim=0, unbiased=False)
 
-            opt_gs.zero_grad(set_to_none=True)
-            g_loss.backward()
-            opt_gs.step()
+                    # Subsample T dimension for covariance
+                    idx = torch.randperm(T, device=device)[:64]
+                    x_sub      = x[:, idx, :].reshape(-1, x.shape[-1])
+                    x_fake_sub = x_fake[:, idx, :].reshape(-1, x_fake.shape[-1])
+                    cov_real   = torch.cov(x_sub.T)
+                    cov_fake   = torch.cov(x_fake_sub.T)
+
+                    mean_loss = torch.mean((mean_real - mean_fake) ** 2)
+                    var_loss  = torch.mean((var_real  - var_fake)  ** 2)
+                    cov_loss  = torch.mean((cov_real  - cov_fake)  ** 2)
+
+                    g_mom = mean_loss + var_loss + cov_loss
+
+                    # -----------------------------------------------------------
+                    # Spectral loss (Log-Spectral Distance)
+                    # -----------------------------------------------------------
+                    spectral_loss = lsd(x, x_fake)
+
+                    # -----------------------------------------------------------
+                    # Total generator loss
+                    # -----------------------------------------------------------
+                    g_loss = g_adv + lambda_sup * g_sup + lambda_mom * g_mom + lambda_spec * spectral_loss
+
+                opt_gs.zero_grad(set_to_none=True)
+                scaler_gs.scale(g_loss).backward()
+                scaler_gs.step(opt_gs)
+                scaler_gs.update()
 
         # ---------------------------------------------------------------
         # Logging + per-metric checkpoint saving (every 5 epochs)
@@ -218,17 +214,36 @@ def train_timegan(
             with torch.no_grad():
                 G.eval(); S.eval(); R.eval()
 
-                B_v, T_v, _ = val_batch.shape
-                z_val = torch.randn(B_v, T_v, z_dim, device=device)
+                acf_val_accum = 0.0
+                psd_val_accum = 0.0
+                n_val_batches = 0
 
-                orig_val_labels = orig_labels_map[val_labels] if (val_labels is not None and orig_labels_map is not None) else val_labels
+                for val_batch in val_dataloader:
+                    if isinstance(val_batch, (tuple, list)):
+                        v_batch, v_labels = val_batch
+                    else:
+                        v_batch, v_labels = val_batch, None
+                    
+                    v_batch = v_batch.to(device)
+                    v_labels = v_labels.to(device) if v_labels is not None else None
 
-                h_fv    = G(z_val, val_labels) if is_cond_G else G(z_val)
-                h_fv_s  = S(h_fv, orig_val_labels) if orig_val_labels is not None else S(h_fv)
-                x_fv    = R(h_fv_s)
+                    B_v, T_v, _ = v_batch.shape
+                    z_val = torch.randn(B_v, T_v, z_dim, device=device)
 
-                acf_val   = acf_error(val_batch, x_fv)
-                psd_val   = lsd(val_batch, x_fv)
+                    orig_v_labels = orig_labels_map[v_labels] if (v_labels is not None and orig_labels_map is not None) else v_labels
+
+                    with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
+                        h_fv    = G(z_val, v_labels) if is_cond_G else G(z_val)
+                        h_fv_s  = S(h_fv, orig_v_labels) if orig_v_labels is not None else S(h_fv)
+                        x_fv    = R(h_fv_s, orig_v_labels) if is_cond_R else R(h_fv_s)
+                    x_fv = x_fv.float()
+
+                    acf_val_accum += acf_error(v_batch, x_fv)
+                    psd_val_accum += lsd(v_batch, x_fv)
+                    n_val_batches += 1
+
+                acf_val = acf_val_accum / max(1, n_val_batches)
+                psd_val = psd_val_accum / max(1, n_val_batches)
                 total_val = acf_val + psd_val
 
                 G.train(); S.train(); R.train()

@@ -65,7 +65,7 @@ def main():
 
     S = Supervisor(
         h_dim=LATENT_DIM,
-        num_layers=NUM_LAYERS_SUPERVISOR
+        num_layers=NUM_LAYERS_SUPERVISOR,
     ).to(device)
 
     logger.info("Embedder and Supervisor initialized")
