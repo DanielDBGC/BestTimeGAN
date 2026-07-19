@@ -60,7 +60,10 @@ def compute_acf(x, max_lag=100):
 
     acf = []
     for lag in range(max_lag):
-        v = (x[:, :-lag or None, :] * x[:, lag:, :]).mean()
+        if lag == 0:
+            v = (x * x).mean()
+        else:
+            v = (x[:, :-lag, :] * x[:, lag:, :]).mean()
         acf.append(v)
 
     return torch.stack(acf)
@@ -174,25 +177,82 @@ def spectral_convergence_loss(real_mag, fake_mag, eps=1e-8):
     ref = torch.norm(real_mag, p='fro')
     return diff / (ref + eps)
 
-def temporal_correlation_loss(h: torch.Tensor, h_hat: torch.Tensor) -> torch.Tensor:
+def ssvep_snr_loss(x_real, x_fake, sfreq=1000, 
+                   stim_freqs=(16., 24.),
+                   n_harmonics=3, sig_bw=0.5, noise_bw=2.0):
     """
-    Penalises mismatch in lag-1 temporal correlation structure.
-    Always non-negative: squared autocorrelation difference.
+    Computes MSE between the SNR (in dB) of real and fake signals at SSVEP frequencies
+    and their harmonics.
     """
-    def lag1_autocorr(x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, H)
-        mu  = x.mean(dim=1, keepdim=True)
-        xc  = x - mu                               # centred
-        num = (xc[:, :-1, :] * xc[:, 1:, :]).mean(dim=1)   # (B, H)
-        den = (xc ** 2).mean(dim=1).clamp(min=1e-8)         # (B, H)
-        return num / den                           # (B, H), in [-1, 1]
+    T = x_real.shape[1]
+    freqs = torch.fft.rfftfreq(T, d=1.0/sfreq).to(x_real.device)  # [F]
 
-    ac_real = lag1_autocorr(h)       # (B, H)
-    ac_pred = lag1_autocorr(h_hat)   # (B, H)
-    return F.mse_loss(ac_pred, ac_real)            # always ≥ 0
+    # Calculate power spectra using FFT
+    X_real = torch.fft.rfft(x_real, dim=1)   # [B, F, C]
+    X_fake = torch.fft.rfft(x_fake, dim=1)
+    
+    P_real = X_real.abs() ** 2  # [B, F, C]
+    P_fake = X_fake.abs() ** 2
 
-def supervised_loss(h, h_hat, lambda_tcl=0.1):
-    loss_mse = mse(h, h_hat)
-    loss_tcl = temporal_correlation_loss(h, h_hat)
-    total = loss_mse + lambda_tcl * loss_tcl
-    return total, loss_mse, loss_tcl
+    loss = 0.0
+    valid_bands = 0
+    eps = 1e-8
+
+    for sf in stim_freqs:
+        for h in range(1, n_harmonics + 1):
+            target = sf * h
+            
+            sig_mask = (freqs - target).abs() <= sig_bw
+            noise_mask = ((freqs - target).abs() > sig_bw) & ((freqs - target).abs() <= noise_bw)
+            
+            if not sig_mask.any() or not noise_mask.any():
+                continue
+                
+            valid_bands += 1
+
+            sig_power_real = P_real[:, sig_mask, :].mean(dim=1)
+            noise_power_real = P_real[:, noise_mask, :].mean(dim=1)
+            
+            sig_power_fake = P_fake[:, sig_mask, :].mean(dim=1)
+            noise_power_fake = P_fake[:, noise_mask, :].mean(dim=1)
+            
+            snr_real = sig_power_real / (noise_power_real + eps)
+            snr_fake = sig_power_fake / (noise_power_fake + eps)
+            
+            snr_real_db = 10.0 * torch.log10(snr_real + eps)
+            snr_fake_db = 10.0 * torch.log10(snr_fake + eps)
+            
+            loss += F.mse_loss(snr_fake_db, snr_real_db)
+
+    if valid_bands == 0:
+        return torch.tensor(0.0, device=x_real.device)
+        
+    return loss / valid_bands
+
+def supervisor_loss(
+    h_hat: torch.Tensor,
+    h_target: torch.Tensor,
+    h_hat_2step: torch.Tensor,
+    h_hat_from_next: torch.Tensor,
+    lambda_cons: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Single-step supervisor loss: plain MSE + 2-step consistency.
+
+    Parameters
+    ----------
+    h_hat          : S(h_{0:T-2})     – predicted next latent states   (B, T-1, H)
+    h_target       : h_{1:T-1}        – ground-truth targets           (B, T-1, H)
+    h_hat_2step    : S(h_hat)_{0:T-3} – 2-step rollout predictions     (B, T-2, H)
+    h_hat_from_next: S(h_{1:T-2})     – 1-step predictions from t+1   (B, T-2, H)
+    lambda_cons    : weight for the consistency term                    (default 1.0)
+
+    Returns
+    -------
+    total, loss_mse, loss_cons
+    """
+    loss_mse  = F.mse_loss(h_hat, h_target)
+    loss_cons = F.mse_loss(h_hat_2step, h_hat_from_next)
+    total = loss_mse + lambda_cons * loss_cons
+    return total, loss_mse, loss_cons
+

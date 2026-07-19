@@ -45,13 +45,10 @@ SUBJ_VAL   = list(range(10, 11))  # subject 10
 SUBJ_TEST  = list(range(11, 12))  # subject 11
 
 # H5 output paths
-PATH_TRAIN = "data/processed/eeg_train.h5"
-PATH_VAL   = "data/processed/eeg_val.h5"
-PATH_TEST  = "data/processed/eeg_test.h5"
+PATH_TRAIN = "data/processed/eeg_train_8.h5"
+PATH_VAL   = "data/processed/eeg_val_8.h5"
+PATH_TEST  = "data/processed/eeg_test_8.h5"
 
-# Bandpass filter limits applied inside load_all_freq → extract_frequency_segments
-L_FREQ = 0.5
-H_FREQ = 50.0
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -97,8 +94,6 @@ def make_split(
         logger=logger,
         stim_freqs=STIM_FREQS,
         duration_sec=5,
-        l_freq=L_FREQ,
-        h_freq=H_FREQ,
         picks=WANTED_CHANNELS,
     )
     # data:   [N_trials, T, C]

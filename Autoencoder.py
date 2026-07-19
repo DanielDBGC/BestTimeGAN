@@ -42,8 +42,8 @@ def main():
     STIMULUS_FREQS = list(range(4, 61, 4))  # 6–20 Hz
 
 
-    train_dataset = EEGH5Dataset("data/processed/eeg.h5")
-    val_dataset = EEGH5Dataset("data/processed/eeg_val.h5")
+    train_dataset = EEGH5Dataset("data/processed/eeg_train_8.h5")
+    val_dataset = EEGH5Dataset("data/processed/eeg_val_8.h5")
 
 
     dataloader = DataLoader(
@@ -113,10 +113,10 @@ def main():
     # --------------------------------------------------
     # Save checkpoints
     # --------------------------------------------------
-    torch.save(E.state_dict(), "checkpoints/embedder_12.0.pt")
-    torch.save(R.state_dict(), "checkpoints/recovery_12.0.pt")
+    torch.save(E.state_dict(), "checkpoints/embedder_24_500.pt")
+    torch.save(R.state_dict(), "checkpoints/recovery_24_500.pt")
 
-    with open("checkpoints/history.json", "w") as f:
+    with open("checkpoints/history_24_500.json", "w") as f:
         json.dump(history, f, indent=4)
 
     logger.info("Autoencoder training complete")

@@ -232,8 +232,6 @@ def extract_frequency_segments(
     stim_freq: float,
     duration_sec: float,
     picks: list[str],
-    l_freq: float,
-    h_freq: float,
     ) -> list[np.ndarray]:
     """
     Load one EDF block and extract all segments for a given stimulation frequency.
@@ -247,8 +245,8 @@ def extract_frequency_segments(
     # FIX: Filter continuous data BEFORE cropping
     # ----------------------------
     data.filter(
-        l_freq=l_freq,
-        h_freq=h_freq,
+        l_freq=stim_freq-2,
+        h_freq=(stim_freq*3)+2,
         fir_design="firwin",
         phase="zero",
     )
@@ -312,24 +310,28 @@ def load_subject_frequency(
 
     return np.concatenate(all_segments, axis=0)
 
-def robust_clip_normalize(X: torch.Tensor, clip_sigma: float = 4.0) -> torch.Tensor:
+
+def robust_clip_normalize(X: np.ndarray, clip_sigma: float = 4.0) -> np.ndarray:
     """
-    Clip extreme outliers then re-normalise per channel.
-    X: [N, T, C]  (your full dataset tensor)
+    Robustly clip extreme outliers using Median and IQR, preventing 
+    outliers from skewing the normalization metrics.
+    """
+    # 1. Calculate robust statistics (Median and IQR)
+    median = np.median(X, axis=(0, 1), keepdims=True)
     
-    Why 4σ: retains ~99.99% of normal EEG while clipping artefacts.
-    Tanh has meaningful gradient up to ~±2.5; beyond ±4 it is effectively zero.
-    """
-    if not isinstance(X, torch.Tensor):
-        X = torch.tensor(X)
-        
-    mean = X.mean(dim=[0, 1], keepdim=True)   # [1, 1, C]
-    std  = X.std(dim=[0, 1],  keepdim=True)   # [1, 1, C]
-
-    X_norm = (X - mean) / (std + 1e-8)        # z-score per channel
-    X_clip = X_norm.clamp(-clip_sigma, clip_sigma)
-
-    # Re-normalise after clipping so std≈1 is restored
-    m2 = X_clip.mean(dim=[0, 1], keepdim=True)
-    s2 = X_clip.std(dim=[0, 1],  keepdim=True)
+    q75, q25 = np.percentile(X, [75, 25], axis=(0, 1), keepdims=True)
+    iqr = q75 - q25
+    
+    # 2. Approximate standard deviation from IQR (for normal distributions std ≈ IQR / 1.349)
+    pseudo_std = iqr / 1.349
+    
+    # 3. Z-score using robust metrics
+    X_norm = (X - median) / (pseudo_std + 1e-8)
+    
+    # 4. Clip (or you could use np.tanh(X_norm / clip_sigma) * clip_sigma for soft clipping)
+    X_clip = np.tanh(X_norm / 2.5) * 2.5
+    # 5. Final re-center to ensure mean 0, std 1
+    m2 = np.mean(X_clip, axis=(0, 1), keepdims=True)
+    s2 = np.std(X_clip, axis=(0, 1), keepdims=True)
+    
     return (X_clip - m2) / (s2 + 1e-8)

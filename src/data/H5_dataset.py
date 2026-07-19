@@ -18,8 +18,7 @@ class EEGH5Dataset(Dataset):
         Path to the .h5 file written by ``save_dataset_h5``.
     keep_classes : list of int or None
         When provided, only samples whose label is in this list are
-        returned.  Labels are **remapped to a contiguous 0-based range**
-        so the returned ``y`` tensors are always in [0, len(keep_classes)).
+        returned.  Labels are returned **as-is** (no remapping).
 
         Example — train the GAN on only two classes::
 
@@ -47,13 +46,7 @@ class EEGH5Dataset(Dataset):
             mask = np.isin(all_labels, list(keep_set))
             self._indices = np.where(mask)[0]          # flat indices into the H5
 
-            # Remap kept labels to 0-based integers
-            # e.g. keep_classes=[3, 7] → 3→0, 7→1
-            sorted_classes = sorted(keep_set)
-            remap = {orig: new for new, orig in enumerate(sorted_classes)}
-            self._labels = np.array(
-                [remap[all_labels[i]] for i in self._indices], dtype=np.int64
-            )
+            self._labels = all_labels[self._indices].astype(np.int64)
         else:
             # No filter: identity mapping over all samples
             self._indices = np.arange(len(all_labels), dtype=np.int64)

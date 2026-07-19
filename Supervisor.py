@@ -11,7 +11,10 @@ from src.utils.config import (
     WANTED_CHANNELS,
     NUM_LAYERS_EMBEDDER,
     NUM_LAYERS_SUPERVISOR,
-    NUM_CHANNELS
+    NUM_CHANNELS,
+    NUM_CLASSES,
+    LABEL_EMB_DIM,
+    WINDOW_SIZE
 )
 
 from src.utils.seed import set_seed
@@ -66,11 +69,13 @@ def main():
     S = Supervisor(
         h_dim=LATENT_DIM,
         num_layers=NUM_LAYERS_SUPERVISOR,
+        num_classes=NUM_CLASSES,
+        label_emb_dim=LABEL_EMB_DIM,
     ).to(device)
 
     logger.info("Embedder and Supervisor initialized")
 
-    E.load_state_dict(torch.load("c:\\Users\\danie_13ucdo4\\OneDrive\\Desktop\\ITAM\\Tesis\\Prueba\\BestTimeGAN\\checkpoints\\embedder_12.0.pt", weights_only=True))
+    E.load_state_dict(torch.load("c:\\Users\\danie_13ucdo4\\OneDrive\\Desktop\\ITAM\\Tesis\\Prueba\\BestTimeGAN\\checkpoints\\best_embedder_24_500.pt", weights_only=True))
 
     logger.info("Embedder loaded")
     # --------------------------------------------------
@@ -88,7 +93,7 @@ def main():
         val_loader=val_dataloader
     )
 
-    torch.save(S.state_dict(), "checkpoints/supervisor_12.0.pt")
+    torch.save(S.state_dict(), "checkpoints/supervisor_24_50.pt")
     logger.info("Supervisor saved")
 
 if __name__ == "__main__": 
