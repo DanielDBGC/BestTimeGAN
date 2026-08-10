@@ -109,6 +109,7 @@ def load_all_freq(
     base_path: str,
     logger,
     stim_freqs: list[float] | None = None,
+    normalize: bool = True,
     **kwargs,
 ) -> tuple[np.ndarray, list, dict]:
     """
@@ -173,15 +174,47 @@ def load_all_freq(
             tsv_path = (
                 f"{base_path}/sub-{subj:03d}_ses-04_block-{block_id:03d}_task-ssvep_events.tsv"
             )
+            
+            try:
+                data = mne.io.read_raw_edf(edf_path, preload=True)
+            except Exception as e:
+                logger.warning(f"Could not load {edf_path}: {e}")
+                continue
+                
+            # ----------------------------
+            # Broadband filter 1-100 Hz to preserve all SSVEP peaks
+            # ----------------------------
+            data.filter(
+                l_freq=1.0,
+                h_freq=100.0,
+                fir_design="firwin",
+                phase="zero",
+            )
+            
+            sfreq = data.info["sfreq"]
+            events_df = pd.read_csv(tsv_path, sep="\t")
 
             for stim_freq in stim_freqs:
+                stim_events = events_df[
+                    (events_df["stim_frequency"] == stim_freq)
+                    & (events_df["value"] % 2 == 0)
+                ]
 
-                segments = extract_frequency_segments(
-                    edf_path=edf_path,
-                    tsv_path=tsv_path,
-                    stim_freq=stim_freq,
-                    **kwargs,
-                )
+                segments = []
+                for _, row in stim_events.iterrows():
+                    onset = row["onset"]          # seconds
+                    duration_samples = (kwargs.get('duration_sec', 5) * sfreq) + 124
+
+                    tmin = onset
+                    tmax = onset + duration_samples
+
+                    seg = data.copy().crop(
+                        tmin=tmin / sfreq, 
+                        tmax=tmax / sfreq
+                    )
+
+                    final_data = seg.get_data(picks=kwargs.get('picks')).T  # (T, C)
+                    segments.append(final_data)
 
                 if len(segments) > 0:
                     subject_segments.extend(segments)
@@ -195,16 +228,17 @@ def load_all_freq(
         # -------------------------------------------------
         # 2) Per-subject normalization
         # -------------------------------------------------
-        subject_concat = np.concatenate(subject_segments, axis=0)
+        if normalize:
+            subject_concat = np.concatenate(subject_segments, axis=0)
 
-        stats = compute_channel_stats(subject_concat)
+            stats = compute_channel_stats(subject_concat)
 
-        subject_stats[subj] = stats
+            subject_stats[subj] = stats
 
-        subject_segments = [
-            apply_channel_norm(seg, stats)
-            for seg in subject_segments
-        ]
+            subject_segments = [
+                apply_channel_norm(seg, stats)
+                for seg in subject_segments
+            ]
 
         logger.info(f"Subject: {subj}")
         normalized_concat = np.concatenate(subject_segments, axis=0)
@@ -242,11 +276,11 @@ def extract_frequency_segments(
     data = mne.io.read_raw_edf(edf_path, preload=True)
     
     # ----------------------------
-    # FIX: Filter continuous data BEFORE cropping
+    # Broadband filter 1-100 Hz
     # ----------------------------
     data.filter(
-        l_freq=stim_freq-2,
-        h_freq=(stim_freq*3)+2,
+        l_freq=1.0,
+        h_freq=100.0,
         fir_design="firwin",
         phase="zero",
     )

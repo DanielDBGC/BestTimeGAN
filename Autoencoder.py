@@ -38,8 +38,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
-    
-    STIMULUS_FREQS = list(range(4, 61, 4))  # 6–20 Hz
+    STIMULUS_FREQS = list(range(4, 61, 4))  # 4–60 Hz
 
 
     train_dataset = EEGH5Dataset("data/processed/eeg_train_8.h5")

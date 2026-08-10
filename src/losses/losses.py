@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 # Loss functions
 mse = nn.MSELoss()
@@ -17,11 +18,11 @@ def reconstruction_loss(x: torch.Tensor, x_tilde: torch.Tensor) -> torch.Tensor:
 
 
 def discriminator_loss(d_real, d_fake):
-    # WGAN discriminator loss: minimize fake - real
-    return torch.mean(d_fake) - torch.mean(d_real)
+    # Hinge discriminator loss
+    return F.relu(1.0 - d_real).mean() + F.relu(1.0 + d_fake).mean()
 
 def generator_adv_loss(d_fake):
-    # WGAN generator loss: minimize -fake
+    # Hinge generator loss
     return -torch.mean(d_fake)
 
 def gradient_penalty(D, h_real, h_fake, device="cuda", labels=None):
@@ -53,6 +54,22 @@ def gradient_penalty(D, h_real, h_fake, device="cuda", labels=None):
     gradient_norm = gradients.norm(2, dim=1)
     penalty = torch.mean((gradient_norm - 1) ** 2)
     return penalty
+
+def r1_penalty(d_real, x_real):
+    """
+    R1 regularization penalty.
+    d_real: output of discriminator on real data
+    x_real: real data (requires_grad=True)
+    """
+    grad_real = torch.autograd.grad(
+        outputs=d_real.sum(),
+        inputs=x_real,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True
+    )[0]
+    grad_penalty = grad_real.pow(2).reshape(grad_real.shape[0], -1).sum(1).mean()
+    return grad_penalty
 
 def compute_acf(x, max_lag=100):
     # x: (B, T, C)
@@ -177,57 +194,62 @@ def spectral_convergence_loss(real_mag, fake_mag, eps=1e-8):
     ref = torch.norm(real_mag, p='fro')
     return diff / (ref + eps)
 
-def ssvep_snr_loss(x_real, x_fake, sfreq=1000, 
-                   stim_freqs=(16., 24.),
-                   n_harmonics=3, sig_bw=0.5, noise_bw=2.0):
-    """
-    Computes MSE between the SNR (in dB) of real and fake signals at SSVEP frequencies
-    and their harmonics.
-    """
-    T = x_real.shape[1]
-    freqs = torch.fft.rfftfreq(T, d=1.0/sfreq).to(x_real.device)  # [F]
-
-    # Calculate power spectra using FFT
-    X_real = torch.fft.rfft(x_real, dim=1)   # [B, F, C]
-    X_fake = torch.fft.rfft(x_fake, dim=1)
+def ssvep_snr_loss(x_real, x_fake, batch_stim_freqs, sfreq=1000,
+                   n_harmonics=3, sig_bw=0.5, noise_bw=4.0):
+    B, T, C = x_real.shape
+    freq_res = sfreq / T
     
-    P_real = X_real.abs() ** 2  # [B, F, C]
-    P_fake = X_fake.abs() ** 2
+    # Safety check
+    assert noise_bw > 2 * freq_res, \
+        f"noise_bw={noise_bw} Hz too narrow for freq_res={freq_res:.2f} Hz/bin"
 
-    loss = 0.0
-    valid_bands = 0
+    freqs = torch.fft.rfftfreq(T, d=1.0/sfreq).to(x_real.device)
+
+    # Hann window to reduce spectral leakage
+    window = torch.hann_window(T, device=x_real.device).unsqueeze(0).unsqueeze(-1)
+    window_power = (window ** 2).mean()
+
+    X_real = torch.fft.rfft(x_real * window, dim=1)
+    X_fake = torch.fft.rfft(x_fake * window, dim=1)
+    P_real = X_real.abs() ** 2 / (window_power * T)
+    P_fake = X_fake.abs() ** 2 / (window_power * T)
+
     eps = 1e-8
+    total_loss = torch.tensor(0.0, device=x_real.device)
+    valid_count = 0
 
-    for sf in stim_freqs:
+    for i in range(B):
+        sf = batch_stim_freqs[i].item()
+        sample_snrs_real, sample_snrs_fake = [], []
+
         for h in range(1, n_harmonics + 1):
             target = sf * h
-            
+            if target > freqs.max():
+                break
+
             sig_mask = (freqs - target).abs() <= sig_bw
-            noise_mask = ((freqs - target).abs() > sig_bw) & ((freqs - target).abs() <= noise_bw)
-            
-            if not sig_mask.any() or not noise_mask.any():
+            noise_mask = (
+                ((freqs - target).abs() > sig_bw) & 
+                ((freqs - target).abs() <= noise_bw) &
+                (freqs > freq_res)  # exclude DC
+            )
+
+            if not sig_mask.any() or noise_mask.sum() < 2:  # need at least 2 noise bins
                 continue
-                
-            valid_bands += 1
 
-            sig_power_real = P_real[:, sig_mask, :].mean(dim=1)
-            noise_power_real = P_real[:, noise_mask, :].mean(dim=1)
-            
-            sig_power_fake = P_fake[:, sig_mask, :].mean(dim=1)
-            noise_power_fake = P_fake[:, noise_mask, :].mean(dim=1)
-            
-            snr_real = sig_power_real / (noise_power_real + eps)
-            snr_fake = sig_power_fake / (noise_power_fake + eps)
-            
-            snr_real_db = 10.0 * torch.log10(snr_real + eps)
-            snr_fake_db = 10.0 * torch.log10(snr_fake + eps)
-            
-            loss += F.mse_loss(snr_fake_db, snr_real_db)
+            snr_r = P_real[i, sig_mask, :].mean(0) / (P_real[i, noise_mask, :].mean(0) + eps)
+            snr_f = P_fake[i, sig_mask, :].mean(0) / (P_fake[i, noise_mask, :].mean(0) + eps)
 
-    if valid_bands == 0:
-        return torch.tensor(0.0, device=x_real.device)
-        
-    return loss / valid_bands
+            sample_snrs_real.append(10.0 * torch.log10(snr_r + eps))
+            sample_snrs_fake.append(10.0 * torch.log10(snr_f + eps))
+
+        if sample_snrs_real:
+            snr_r_all = torch.stack(sample_snrs_real)  # [H, C]
+            snr_f_all = torch.stack(sample_snrs_fake)
+            total_loss = total_loss + F.mse_loss(snr_f_all, snr_r_all)
+            valid_count += 1
+
+    return total_loss / max(valid_count, 1)
 
 def supervisor_loss(
     h_hat: torch.Tensor,
@@ -256,3 +278,38 @@ def supervisor_loss(
     total = loss_mse + lambda_cons * loss_cons
     return total, loss_mse, loss_cons
 
+def reference_signals(freq, T, fs, n_harmonics=2):
+    """
+    freq: (B,) stim frequency per sample, in Hz
+    returns: (B, T, 2*n_harmonics)
+    """
+    device, dtype = freq.device, freq.dtype
+    t = torch.arange(T, device=device, dtype=dtype) / fs   # (T,)
+    freq = freq.view(-1, 1)                                 # (B, 1)
+    t = t.view(1, -1)                                       # (1, T)
+    refs = []
+    for h in range(1, n_harmonics + 1):
+        angle = 2 * math.pi * h * freq * t                  # (B, T) broadcast, per-sample freq
+        refs.append(torch.sin(angle))
+        refs.append(torch.cos(angle))
+    return torch.stack(refs, dim=-1)                         # (B, T, K)
+
+
+def ssvep_corr_loss(x, freq, fs, n_harmonics=2, eps=1e-6):
+    """
+    x:    (B, T, C) generated signal
+    freq: (B,)      stim frequency per sample, in Hz
+    """
+    B, T, C = x.shape
+    refs = reference_signals(freq, T, fs, n_harmonics)       # (B, T, K)
+
+    x_c = x - x.mean(dim=1, keepdim=True)                    # (B, T, C)
+    r_c = refs - refs.mean(dim=1, keepdim=True)               # (B, T, K)  <- mean over TIME, per sample
+
+    cross = torch.einsum('btc,btk->bck', x_c, r_c)            # (B, C, K)
+    x_norm = x_c.norm(dim=1)                                  # (B, C)
+    r_norm = r_c.norm(dim=1)                                  # (B, K)
+    denom = x_norm.unsqueeze(-1) * r_norm.unsqueeze(1) + eps  # (B, C, K)
+
+    corr = cross / denom                                      # Pearson r per (sample, channel, ref)
+    return 1 - (corr ** 2).mean()

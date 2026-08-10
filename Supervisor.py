@@ -14,7 +14,10 @@ from src.utils.config import (
     NUM_CHANNELS,
     NUM_CLASSES,
     LABEL_EMB_DIM,
-    WINDOW_SIZE
+    FREQ_DIM,
+    FREQ_N_HARMONICS,
+    SSVEP_FS,
+    ALL_STIM_FREQS,
 )
 
 from src.utils.seed import set_seed
@@ -69,13 +72,12 @@ def main():
     S = Supervisor(
         h_dim=LATENT_DIM,
         num_layers=NUM_LAYERS_SUPERVISOR,
-        num_classes=NUM_CLASSES,
-        label_emb_dim=LABEL_EMB_DIM,
+        freq_dim=FREQ_DIM,
     ).to(device)
 
     logger.info("Embedder and Supervisor initialized")
 
-    E.load_state_dict(torch.load("c:\\Users\\danie_13ucdo4\\OneDrive\\Desktop\\ITAM\\Tesis\\Prueba\\BestTimeGAN\\checkpoints\\best_embedder_24_500.pt", weights_only=True))
+    E.load_state_dict(torch.load("checkpoints/best_embedder_24_500.pt", weights_only=True))
 
     logger.info("Embedder loaded")
     # --------------------------------------------------
@@ -90,7 +92,10 @@ def main():
         device,
         epochs=EPOCHS_SUPERVISOR,
         logger=logger,
-        val_loader=val_dataloader
+        val_loader=val_dataloader,
+        stim_freqs=ALL_STIM_FREQS,
+        fs=SSVEP_FS,
+        n_harmonics=FREQ_N_HARMONICS,
     )
 
     torch.save(S.state_dict(), "checkpoints/supervisor_24_50.pt")

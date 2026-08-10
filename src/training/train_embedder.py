@@ -232,8 +232,9 @@ def train_autoencoder(
             if val_loss < best_val:
                 best_val = val_loss
                 patience_counter = 0
-                torch.save(E.state_dict(), "best_embedder.pt")
-                logger.info("Saved best_embedder.pt (new best val loss)")
+                torch.save(E.state_dict(), "checkpoints/best_embedder_24_500.pt")
+                torch.save(R.state_dict(), "checkpoints/best_recovery_24_500.pt")
+                logger.info("Saved best_embedder_24_500.pt (new best val loss)")
             else:
                 patience_counter += 1
                 logger.info(

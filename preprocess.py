@@ -45,9 +45,9 @@ SUBJ_VAL   = list(range(10, 11))  # subject 10
 SUBJ_TEST  = list(range(11, 12))  # subject 11
 
 # H5 output paths
-PATH_TRAIN = "data/processed/eeg_train_8.h5"
-PATH_VAL   = "data/processed/eeg_val_8.h5"
-PATH_TEST  = "data/processed/eeg_test_8.h5"
+PATH_TRAIN = "data/processed/eeg_train_no_normalization.h5"
+PATH_VAL   = "data/processed/eeg_val_no_normalization.h5"
+PATH_TEST  = "data/processed/eeg_test_no_normalization.h5"
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +73,8 @@ def make_split(
     h5_path: str,
     stats_path: str,
     split_name: str,
+    clip = True,
+    normalize = True,
 ) -> None:
     """
     Load raw EEG for the given subjects, window it, normalize, and save to .h5.
@@ -95,6 +97,8 @@ def make_split(
         stim_freqs=STIM_FREQS,
         duration_sec=5,
         picks=WANTED_CHANNELS,
+        normalize=normalize,
+        
     )
     # data:   [N_trials, T, C]
     # labels: list of float stimulus frequencies, length N_trials
@@ -129,9 +133,10 @@ def make_split(
                 f"min: {X.min():.4f}  max: {X.max():.4f}")
 
     # 7. Robust clip + re-normalize
-    X = robust_clip_normalize(X)
-    logger.info(f"  Clipped stats — mean: {X.mean():.4f}  std: {X.std():.4f}  "
-                f"min: {X.min():.4f}  max: {X.max():.4f}")
+    if clip:
+        X = robust_clip_normalize(X)
+        logger.info(f"  Clipped stats — mean: {X.mean():.4f}  std: {X.std():.4f}  "
+                    f"min: {X.min():.4f}  max: {X.max():.4f}")
 
     # 8. Save to disk
     save_dataset_h5(h5_path, X, y)
@@ -144,8 +149,8 @@ def make_split(
 # ---------------------------------------------------------------------------
 # Build all three splits
 # ---------------------------------------------------------------------------
-make_split(SUBJ_TRAIN, PATH_TRAIN, "data/stats/stats_train.pkl", "train")
-make_split(SUBJ_VAL,   PATH_VAL,   "data/stats/stats_val.pkl",   "val")
-make_split(SUBJ_TEST,  PATH_TEST,  "data/stats/stats_test.pkl",  "test")
+make_split(SUBJ_TRAIN, PATH_TRAIN, "data/stats/stats_train_no_normalization.pkl", "train", clip=False, normalize=False)
+make_split(SUBJ_VAL,   PATH_VAL,   "data/stats/stats_val_no_normalization.pkl",   "val", clip=False, normalize=False)
+make_split(SUBJ_TEST,  PATH_TEST,  "data/stats/stats_test_no_normalization.pkl",  "test", clip=False, normalize=False)
 
 logger.info("Done — all splits written.")

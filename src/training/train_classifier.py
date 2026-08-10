@@ -9,6 +9,7 @@ def train_classifier(
     epochs,
     lr,
     device,
+    orig_labels_map=None,
     logger=None
 ):
     """
@@ -30,6 +31,24 @@ def train_classifier(
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
+    # ------------------------------------------------------------------
+    # Build a reverse map: original label value -> local 0-based index
+    # used by G and D (which have num_classes = n_gan_classes, not NUM_CLASSES).
+    # E.g. if orig_labels_map = [2, 3], then raw label 2 -> 0, raw label 3 -> 1.
+    # ------------------------------------------------------------------
+    if orig_labels_map is not None:
+        _inv_map = {int(v): i for i, v in enumerate(orig_labels_map.tolist())}
+        def _to_local(raw_labels: torch.Tensor) -> torch.Tensor:
+            """Remap raw dataset labels to 0-based local indices for Classifier."""
+            return torch.tensor(
+                [_inv_map[int(l)] for l in raw_labels.tolist()],
+                dtype=torch.long,
+                device=raw_labels.device,
+            )
+    else:
+        def _to_local(raw_labels):
+            return raw_labels
+
     for epoch in range(epochs):
         # -------------------------
         # Train
@@ -40,9 +59,13 @@ def train_classifier(
         total = 0
 
         for X, y in train_loader:
+
+            y = _to_local(y)
+
             X = X.to(device)
             y = y.to(device)
 
+            
             optimizer.zero_grad()
 
             logits = model(X)
@@ -74,6 +97,9 @@ def train_classifier(
 
             with torch.no_grad():
                 for X, y in val_loader:
+
+                    y = _to_local(y)
+
                     X = X.to(device)
                     y = y.to(device)
 

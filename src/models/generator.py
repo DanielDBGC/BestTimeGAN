@@ -1,65 +1,74 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from .freq_conditioning import FiLMLayer
 
 
-class Generator(nn.Module):
-    """Legacy unconditional Generator — kept for backward compatibility."""
-    def __init__(self, z_dim, h_dim, num_layers):
-        super().__init__()
-        self.rnn = nn.GRU(
-            input_size=z_dim,
-            hidden_size=h_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=0.1 if num_layers > 1 else 0.0
+class CausalConv1d(nn.Conv1d):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation=1, **kwargs):
+        super(CausalConv1d, self).__init__(
+            in_channels, out_channels, kernel_size, padding=(kernel_size - 1) * dilation, dilation=dilation, **kwargs
         )
-        self.ln = nn.LayerNorm(h_dim)
-        self.fc = nn.Linear(h_dim, 12)
 
-    def forward(self, z):
-        # z: [B, T, z_dim]
-        h_hat, _ = self.rnn(z)
-        h_hat = self.ln(h_hat)
-        h_hat = self.fc(h_hat)
-        return h_hat  # [B, T, h_dim]
+    def forward(self, x):
+        # x is of shape (B, C, T)
+        # causal padding was added on both sides, we need to remove the right side
+        out = super(CausalConv1d, self).forward(x)
+        return out[:, :, :-self.padding[0]]
 
 
-class _ResidualGRUBlock(nn.Module):
-    """Single GRU layer with residual skip connection and LayerNorm."""
-
-    def __init__(self, h_dim: int, dropout: float = 0.1):
+class GatedResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation, freq_dim):
         super().__init__()
-        self.gru = nn.GRU(
-            input_size=h_dim,
-            hidden_size=h_dim,
-            num_layers=1,
-            batch_first=True,
-        )
-        self.norm = nn.LayerNorm(h_dim)
-        self.drop = nn.Dropout(dropout)
+        
+        self.conv = CausalConv1d(in_channels, 2 * out_channels, kernel_size, dilation=dilation)
+        
+        # FiLM modulation replaces the old cond_conv (label embedding projection).
+        # Applied to the gated activation output, re-injecting frequency info at
+        # every layer so the stimulus signal stays alive through depth.
+        self.film = FiLMLayer(freq_dim, out_channels)
+        
+        # 1x1 convs for residual and skip connection
+        self.res_conv = nn.Conv1d(out_channels, out_channels, 1)
+        self.skip_conv = nn.Conv1d(out_channels, out_channels, 1)
 
-    def forward(self, x: torch.Tensor, hidden=None):
-        # x: [B, T, h_dim]
-        out, h = self.gru(x, hidden)      # [B, T, h_dim]
-        out = self.drop(out)
-        out = self.norm(out + x)          # residual connection
-        return out, h
+    def forward(self, x, freq_basis):
+        """
+        x          : [B, C, T]
+        freq_basis : [B, T, freq_dim]
+        """
+        residual = x
+        
+        # Dilated causal conv
+        out = self.conv(x)
+        
+        # Gated activation
+        # out has 2 * out_channels
+        filter_out, gate_out = out.chunk(2, dim=1)
+        out = torch.tanh(filter_out) * torch.sigmoid(gate_out)
+        
+        # FiLM modulation: transpose to [B, T, C], modulate, transpose back
+        out_t = out.transpose(1, 2)                  # [B, T, out_channels]
+        out_t = self.film(out_t, freq_basis)          # [B, T, out_channels]
+        out = out_t.transpose(1, 2)                   # [B, out_channels, T]
+        
+        skip = self.skip_conv(out)
+        res = self.res_conv(out) + residual
+        
+        return res, skip
 
 
 class cGenerator(nn.Module):
     """
-    Conditional Generator for TimeGAN.
+    Conditional Generator for TimeGAN using Gated Causal TCN (WaveNet-style)
+    with sinusoidal frequency conditioning via FiLM modulation.
 
-    Takes noise z [B, T, z_dim] and integer class labels [B], and produces
-    a latent trajectory [B, T, out_dim] that can be passed directly to the
-    Supervisor (which operates in LATENT_DIM space).
+    Takes noise z [B, T, z_dim] and a precomputed frequency basis
+    [B, T, freq_dim], and produces a latent trajectory [B, T, out_dim].
 
-    Architecture
-    ------------
-    1. Label embedding  : Embedding(num_classes, label_emb_dim)
-    2. Input projection : Linear(z_dim + label_emb_dim, h_dim)
-    3. Residual GRU stack: num_layers × _ResidualGRUBlock(h_dim)
-    4. Output projection: Linear(h_dim, out_dim)   — out_dim = LATENT_DIM
+    The frequency basis (sin/cos of f_stim and harmonics) is injected at
+    every GatedResidualBlock via FiLM, keeping the stimulus signal alive
+    through the full depth of the network.
     """
 
     def __init__(
@@ -68,48 +77,56 @@ class cGenerator(nn.Module):
         h_dim: int,
         num_layers: int,
         out_dim: int = 12,
-        num_classes: int = 15,
-        label_emb_dim: int = 16,
-        dropout: float = 0.1,
+        freq_dim: int = 6,
+        kernel_size: int = 3,
+        dropout: float = 0.1,  # Not used in standard WaveNet, but kept for signature
     ):
         super().__init__()
 
-        # --- conditioning ---
-        self.label_emb = nn.Embedding(num_classes, label_emb_dim)
+        self.start_conv = nn.Conv1d(z_dim, h_dim, 1)
+        
+        self.blocks = nn.ModuleList()
+        # Typically dilations go 1, 2, 4, 8...
+        for i in range(num_layers):
+            dilation = 2 ** i
+            self.blocks.append(
+                GatedResidualBlock(
+                    in_channels=h_dim,
+                    out_channels=h_dim,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    freq_dim=freq_dim,
+                )
+            )
 
-        # --- input projection: merge noise + label embedding ---
-        self.input_proj = nn.Linear(z_dim + label_emb_dim, h_dim)
-        self.input_norm = nn.LayerNorm(h_dim)
+        # Output layers (post-skip connections)
+        self.end_conv1 = nn.Conv1d(h_dim, h_dim, 1)
+        self.end_conv2 = nn.Conv1d(h_dim, out_dim, 1)
 
-        # --- residual GRU stack ---
-        self.blocks = nn.ModuleList(
-            [_ResidualGRUBlock(h_dim, dropout=dropout if i < num_layers - 1 else 0.0)
-             for i in range(num_layers)]
-        )
-
-        # --- output projection to latent space ---
-        self.output_proj = nn.Linear(h_dim, out_dim)
-
-    def forward(self, z: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, freq_basis: torch.Tensor) -> torch.Tensor:
         """
-        Parameters
-        ----------
-        z      : [B, T, z_dim]   — noise input
-        labels : [B]             — integer class labels (0 … num_classes-1)
-
-        Returns
-        -------
-        h_hat  : [B, T, out_dim]
+        z          : [B, T, z_dim]
+        freq_basis : [B, T, freq_dim]  — precomputed sinusoidal features
+        Returns    : [B, T, out_dim]
         """
-        # Expand label embedding across time
-        emb = self.label_emb(labels)                        # [B, label_emb_dim]
-        emb = emb.unsqueeze(1).expand(-1, z.size(1), -1)   # [B, T, label_emb_dim]
+        B, T, _ = z.size()
+        
+        # Prepare inputs (transpose to [B, C, T] for conv1d)
+        x = z.transpose(1, 2)  # [B, z_dim, T]
+        x = self.start_conv(x) # [B, h_dim, T]
 
-        # Project input
-        x = self.input_norm(self.input_proj(torch.cat([z, emb], dim=-1)))  # [B, T, h_dim]
-
-        # Residual GRU pass
+        skip_connections = []
+        
         for block in self.blocks:
-            x, _ = block(x)
-
-        return self.output_proj(x)  # [B, T, out_dim]
+            x, skip = block(x, freq_basis)
+            skip_connections.append(skip)
+            
+        # Sum skip connections
+        out = sum(skip_connections)
+        out = F.relu(out)
+        out = self.end_conv1(out)
+        out = F.relu(out)
+        out = self.end_conv2(out)  # [B, out_dim, T]
+        
+        # Transpose back to [B, T, out_dim]
+        return out.transpose(1, 2)

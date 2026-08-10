@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from .freq_conditioning import FiLMLayer
 
 
 class Discriminator(nn.Module):
@@ -76,7 +77,7 @@ class _ResidualTCNBlock(nn.Module):
     - Residual skip via 1×1 conv when in/out channels differ
     """
 
-    def __init__(self, in_ch: int, out_ch: int, dilation: int):
+    def __init__(self, in_ch: int, out_ch: int, dilation: int, freq_dim: int):
         super().__init__()
         pad = dilation  # preserves sequence length for kernel_size=3
         self.conv = nn.utils.spectral_norm(
@@ -85,6 +86,8 @@ class _ResidualTCNBlock(nn.Module):
         self.act  = nn.LeakyReLU(0.2, inplace=True)
         # LayerNorm expects [..., C]; we'll permute before/after
         self.norm = nn.LayerNorm(out_ch)
+        
+        self.film = FiLMLayer(freq_dim, out_ch)
 
         # Skip connection
         self.skip = (
@@ -93,84 +96,81 @@ class _ResidualTCNBlock(nn.Module):
             else nn.Identity()
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, freq_basis: torch.Tensor) -> torch.Tensor:
         # x: [B, C_in, T]
         residual = self.skip(x)               # [B, C_out, T]
         out = self.act(self.conv(x))          # [B, C_out, T]
         # LayerNorm on channel dim: permute to [B, T, C], norm, permute back
-        out = self.norm(out.transpose(1, 2)).transpose(1, 2)
+        out = out.transpose(1, 2)
+        out = self.norm(out)
+        out = self.film(out, freq_basis)
+        out = out.transpose(1, 2)
         return out + residual                 # [B, C_out, T]
 
 
 class cTCNDiscriminator(nn.Module):
     """
-    Conditional TCN Discriminator.
+    Conditional TCN Discriminator with sinusoidal frequency conditioning.
 
-    Receives a latent sequence h [B, T, in_channels] and integer class labels
-    [B], concatenates a label embedding along the channel axis, then passes
-    through 4 residual dilated-conv blocks (dilations 1, 2, 4, 8) with
-    spectral normalization.  Global average pooling + linear head → scalar.
+    Receives a latent sequence h [B, T, in_channels] and a precomputed
+    frequency basis [B, T, freq_dim], concatenates them along the channel
+    axis, then passes through 4 residual dilated-conv blocks (dilations
+    1, 2, 4, 8) with spectral normalization.  Per-timestep linear head → scalar.
 
     Parameters
     ----------
     in_channels     : latent space dimension (LATENT_DIM)
     hidden_channels : internal TCN width
-    num_classes     : number of class labels
-    label_emb_dim   : embedding size for conditioning
+    freq_dim        : dimensionality of the sinusoidal frequency basis
     """
 
     def __init__(
         self,
         in_channels: int,
         hidden_channels: int = 64,
-        num_classes: int = 15,
-        label_emb_dim: int = 16,
+        freq_dim: int = 6,
     ):
         super().__init__()
 
-        # Label conditioning
-        self.label_emb = nn.Embedding(num_classes, label_emb_dim)
-
-        # First conv: maps (in_channels + label_emb_dim) → hidden_channels
-        cond_in = in_channels + label_emb_dim
+        # First conv: maps in_channels → hidden_channels
         self.input_conv = nn.utils.spectral_norm(
-            nn.Conv1d(cond_in, hidden_channels, kernel_size=1)
+            nn.Conv1d(in_channels, hidden_channels, kernel_size=1)
         )
 
         # Residual TCN blocks (dilations: 1, 2, 4, 8)
         dilations = [1, 2, 4, 8]
         self.blocks = nn.ModuleList([
-            _ResidualTCNBlock(hidden_channels, hidden_channels, d)
+            _ResidualTCNBlock(hidden_channels, hidden_channels, d, freq_dim)
             for d in dilations
         ])
 
         # Scalar output head
         self.head = nn.Linear(hidden_channels, 1)
 
-    def forward(self, h: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    def forward(self, h: torch.Tensor, freq_basis: torch.Tensor) -> torch.Tensor:
         """
         Parameters
         ----------
-        h      : [B, T, in_channels]
-        labels : [B]
+        h          : [B, T, in_channels]
+        freq_basis : [B, T, freq_dim]  — precomputed sinusoidal features
 
         Returns
         -------
-        out    : [B, 1]
+        out    : [B, T, 1]
         """
         B, T, _ = h.shape
 
-        # Concat label embedding along channel dim
-        emb = self.label_emb(labels)                       # [B, label_emb_dim]
-        emb = emb.unsqueeze(1).expand(-1, T, -1)           # [B, T, label_emb_dim]
-        x = torch.cat([h, emb], dim=-1)                    # [B, T, in_ch + emb]
-
-        # Transpose to [B, C, T] for Conv1d
-        x = x.transpose(1, 2)                              # [B, C, T]
+        x = h.transpose(1, 2)                              # [B, C, T]
         x = self.input_conv(x)                             # [B, hidden, T]
 
         for block in self.blocks:
-            x = block(x)                                   # [B, hidden, T]
+            x = block(x, freq_basis)                       # [B, hidden, T]
 
-        x = x.mean(dim=2)                                  # global avg pool → [B, hidden]
-        return self.head(x)                                 # [B, 1]
+        # No global average pooling. We evaluate each timestep.
+        x = x.transpose(1, 2)                              # [B, T, hidden]
+        out = self.head(x)                                 # [B, T, 1]
+        
+        # We return the per-timestep scores. Hinge loss will apply ReLU 
+        # to each timestep independently.
+        return out
+
